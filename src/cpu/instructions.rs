@@ -20,8 +20,8 @@ pub enum InstructionType {
 
 /// 8bitレジスタの識別子
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+A, B, C, D, E, H, L,
 pub enum Register8 {
-    A, B, C, D, E, H, L,
 }
 
 /// 16bitレジスタの識別子
