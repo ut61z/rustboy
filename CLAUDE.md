@@ -138,6 +138,9 @@
 
 ### 開発ガイドライン
 - TDDで実装すること
+- git commit メッセージはsemanticであること
+    - `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore` をprefixとして用いること
+    - 例: `feat: Aを新規実装` , `chore: ライブラリをバージョンアップ`
 - すべてのファイルは最終行に空の行を追加すること
 - CPUテストはBootROM競合を避けるためWRAM領域（0xC000+）を使用すること
 - レジスタペア関数はハードウェア精確ビットマスキングを維持すること
