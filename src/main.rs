@@ -6,10 +6,16 @@ mod memory_map;      // メモリマップ定義
 mod memory;          // メモリコンポーネント
 mod peripherals;     // メモリバス
 mod cpu;             // CPUコンポーネント
+mod ppu;             // PPUコンポーネント
+mod simple_display;  // 簡易ASCII表示
+
+#[cfg(feature = "with_sdl")]
+mod lcd;             // LCDディスプレイ
 
 use memory::BootRom;
 use peripherals::Peripherals;
 use cpu::Cpu;
+use ppu::Ppu;
 
 // メモリマップモジュールから関数をインポート
 use memory_map::{
@@ -98,7 +104,10 @@ fn test_memory_system(bootrom: BootRom) {
     // 7. Phase 3: CPU テスト
     test_cpu_system(&mut peripherals);
     
-    println!("\n=== Phase 2 + Phase 3 テスト完了 ===");
+    // 8. Phase 4: PPU + LCD テスト
+    test_ppu_lcd_system();
+    
+    println!("\n=== Phase 2 + Phase 3 + Phase 4 テスト完了 ===");
 }
 
 fn test_address_info() {
@@ -379,4 +388,259 @@ fn test_simple_program(cpu: &mut Cpu, peripherals: &mut Peripherals) {
     assert_eq!(cpu.registers.b, 0x05);
     
     println!("✓ プログラム実行テスト成功");
+}
+
+fn test_ppu_lcd_system() {
+    
+    println!("\n=== Phase 4: PPU + LCD システムテスト ===");
+    
+    // PPU基本テスト
+    test_ppu_basic();
+    
+    // LCD表示テスト（オプション）
+    #[cfg(feature = "with_sdl")]
+    {
+        println!("\nLCD表示テストを実行しますか？ (5秒間表示)");
+        println!("注意: ウィンドウが開きます。ESCキーで終了できます。");
+        
+        // 環境変数でLCDテストをスキップ可能
+        if std::env::var("SKIP_LCD_TEST").is_ok() {
+            println!("SKIP_LCD_TEST環境変数が設定されているため、LCD表示テストをスキップします。");
+            return;
+        }
+        
+        test_lcd_display();
+    }
+    
+    #[cfg(not(feature = "with_sdl"))]
+    {
+        println!("\nLCD表示テストはSDL2機能が有効でないためスキップされます。");
+        println!("SDL2機能を有効にするには: cargo run --features with_sdl");
+        println!("\n代わりに簡易ASCII表示デモを実行します:");
+        test_simple_display();
+    }
+}
+
+#[cfg(feature = "with_sdl")]
+fn test_lcd_display() {
+    use lcd::{LcdDisplay, LcdEvent, FpsCounter};
+    
+    match LcdDisplay::new("RustBoy - Phase 4 テスト") {
+        Ok(mut display) => {
+            println!("✓ SDL2 LCDディスプレイ初期化成功");
+            
+            let mut fps_counter = FpsCounter::new();
+            let start_time = std::time::Instant::now();
+            let test_duration = std::time::Duration::from_secs(5);
+            
+            // 5秒間のLCD表示テスト
+            while start_time.elapsed() < test_duration {
+                // イベント処理
+                let events = display.poll_events();
+                for event in events {
+                    match event {
+                        LcdEvent::Quit => {
+                            println!("✓ 終了イベント受信");
+                            return;
+                        }
+                        LcdEvent::ButtonDown(button) => {
+                            println!("ボタン押下: {:?}", button);
+                        }
+                        LcdEvent::ButtonUp(button) => {
+                            println!("ボタン離し: {:?}", button);
+                        }
+                    }
+                }
+                
+                // 画面表示テスト（時間に応じてパターン変更）
+                let elapsed_secs = start_time.elapsed().as_secs();
+                match elapsed_secs {
+                    0..=1 => {
+                        if let Err(e) = display.present_solid_color(0x9B, 0xBC, 0x0F) {
+                            eprintln!("表示エラー: {}", e);
+                            break;
+                        }
+                    }
+                    2..=3 => {
+                        if let Err(e) = display.present_checker_pattern() {
+                            eprintln!("表示エラー: {}", e);
+                            break;
+                        }
+                    }
+                    _ => {
+                        if let Err(e) = display.present_gradient_pattern() {
+                            eprintln!("表示エラー: {}", e);
+                            break;
+                        }
+                    }
+                }
+                
+                fps_counter.tick();
+                display.limit_fps();
+            }
+            
+            println!("✓ LCD表示テスト完了 (平均FPS: {:.1})", fps_counter.fps());
+        }
+        Err(e) => {
+            println!("⚠ SDL2初期化失敗: {}", e);
+            println!("  LCDテストをスキップします（システムにSDL2が必要です）");
+        }
+    }
+}
+
+fn test_ppu_basic() {
+    println!("\n--- PPU基本テスト ---");
+    
+    let mut ppu = Ppu::new();
+    
+    // 初期状態確認
+    println!("PPU初期状態: Mode={:?}, Scanline={}, Cycles={}", 
+             ppu.mode, ppu.scanline, ppu.cycles);
+    
+    // PPU step テスト
+    let mut vblank_occurred = false;
+    let mut step_count = 0;
+    
+    // 1フレーム分実行（約70224サイクル）
+    while step_count < 80000 && !vblank_occurred {
+        vblank_occurred = ppu.step();
+        step_count += 1;
+        
+        if step_count % 10000 == 0 {
+            println!("Step {}: Mode={:?}, Scanline={}, Cycles={}", 
+                     step_count, ppu.mode, ppu.scanline, ppu.cycles);
+        }
+    }
+    
+    if vblank_occurred {
+        println!("✓ VBlank割り込み発生 (Step: {})", step_count);
+    } else {
+        println!("⚠ VBlank割り込み未発生");
+    }
+    
+    // VRAM基本テスト
+    println!("\n--- VRAM基本テスト ---");
+    
+    // VRAMに簡単なパターンを書き込み
+    ppu.write(0x8000, 0xFF);  // タイルデータ
+    ppu.write(0x8001, 0x00);
+    ppu.write(0x9800, 0x00);  // タイルマップ
+    
+    let tile_data = ppu.read(0x8000);
+    let tile_map = ppu.read(0x9800);
+    
+    println!("VRAM[0x8000] = 0x{:02X}", tile_data);
+    println!("VRAM[0x9800] = 0x{:02X}", tile_map);
+    
+    assert_eq!(tile_data, 0xFF);
+    assert_eq!(tile_map, 0x00);
+    
+    println!("✓ VRAM読み書きテスト成功");
+    
+    // レジスタテスト
+    println!("\n--- PPUレジスタテスト ---");
+    
+    ppu.write(io_registers::LCDC, 0x91);
+    ppu.write(io_registers::SCY, 0x10);
+    ppu.write(io_registers::SCX, 0x08);
+    
+    assert_eq!(ppu.read(io_registers::LCDC), 0x91);
+    assert_eq!(ppu.read(io_registers::SCY), 0x10);
+    assert_eq!(ppu.read(io_registers::SCX), 0x08);
+    
+    println!("✓ PPUレジスタテスト成功");
+    
+    println!("✓ PPU基本テスト完了");
+}
+
+fn test_simple_display() {
+    use simple_display::SimpleDisplay;
+    
+    println!("\n=== 簡易ASCII表示デモ ===");
+    
+    let display = SimpleDisplay::new();
+    let mut ppu = Ppu::new();
+    
+    // VRAMに簡単なパターンを設定
+    println!("VRAMにテストパターンを設定中...");
+    
+    // タイル0: チェッカーパターン
+    let checker_pattern = [
+        0b10101010, 0b00000000,  // 行0
+        0b01010101, 0b00000000,  // 行1
+        0b10101010, 0b00000000,  // 行2
+        0b01010101, 0b00000000,  // 行3
+        0b10101010, 0b00000000,  // 行4
+        0b01010101, 0b00000000,  // 行5
+        0b10101010, 0b00000000,  // 行6
+        0b01010101, 0b00000000,  // 行7
+    ];
+    
+    for (i, &byte) in checker_pattern.iter().enumerate() {
+        ppu.write(0x8000 + i as u16, byte);
+    }
+    
+    // タイル1: 縦線パターン
+    let vertical_pattern = [
+        0b11001100, 0b00000000,  // 行0
+        0b11001100, 0b00000000,  // 行1
+        0b11001100, 0b00000000,  // 行2
+        0b11001100, 0b00000000,  // 行3
+        0b11001100, 0b00000000,  // 行4
+        0b11001100, 0b00000000,  // 行5
+        0b11001100, 0b00000000,  // 行6
+        0b11001100, 0b00000000,  // 行7
+    ];
+    
+    for (i, &byte) in vertical_pattern.iter().enumerate() {
+        ppu.write(0x8010 + i as u16, byte);
+    }
+    
+    // タイルマップにパターンを設定
+    for i in 0..32*32 {
+        let tile_id = if (i / 32 + i % 32) % 2 == 0 { 0 } else { 1 };
+        ppu.write(0x9800 + i as u16, tile_id);
+    }
+    
+    // PPUレジスタ設定
+    ppu.write(io_registers::LCDC, 0x91);  // LCD有効、BG有効
+    ppu.write(io_registers::BGP, 0b11100100);  // パレット設定
+    
+    // PPU状態表示
+    display.show_ppu_info(&ppu);
+    
+    // 数フレーム実行して画面生成
+    println!("\nPPUを実行してフレームを生成中...");
+    
+    for frame in 0..3 {
+        println!("\n--- フレーム {} 実行 ---", frame + 1);
+        
+        let mut cycles = 0;
+        while cycles < 70224 {
+            let vblank = ppu.step();
+            cycles += 1;
+            
+            if vblank {
+                println!("VBlank発生! (サイクル: {})", cycles);
+                break;
+            }
+        }
+        
+        // フレームバッファ統計表示
+        display.show_framebuffer_stats(&ppu.framebuffer);
+        
+        // 最初のフレームのみ画面表示
+        if frame == 0 {
+            println!("\n実際のフレームバッファを表示:");
+            display.present_frame(&ppu.framebuffer);
+        }
+    }
+    
+    // デモパターン表示
+    display.demo_patterns();
+    
+    println!("\n=== 簡易表示デモ完了 ===");
+    println!("より本格的な表示にはSDL2が必要です:");
+    println!("1. cmake をインストール: sudo pacman -S cmake (Arch) / sudo apt install cmake (Ubuntu)");
+    println!("2. SDL2機能でビルド: cargo run --features with_sdl");
 }
