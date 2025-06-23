@@ -3,6 +3,7 @@ pub mod timing;
 pub mod vram;
 pub mod tiles;
 pub mod background;
+pub mod sprites;
 
 use crate::memory_map::{dmg, io_registers};
 
@@ -18,6 +19,7 @@ pub struct Ppu {
     pub registers: registers::PpuRegisters,
     pub vram: vram::Vram,
     pub oam: [u8; 160],  // Object Attribute Memory
+    pub sprite_renderer: sprites::SpriteRenderer,
     
     // PPU状態
     pub mode: PpuMode,
@@ -38,6 +40,7 @@ impl Ppu {
             registers: registers::PpuRegisters::new(),
             vram: vram::Vram::new(),
             oam: [0; 160],
+            sprite_renderer: sprites::SpriteRenderer::new(),
             
             mode: PpuMode::OamScan,
             cycles: 0,
@@ -247,6 +250,8 @@ impl Ppu {
             dmg::OAM_START..=dmg::OAM_END => {
                 if self.mode != PpuMode::Drawing && self.mode != PpuMode::OamScan {
                     self.oam[(address - dmg::OAM_START) as usize] = value;
+                    // OAM更新時にスプライトレンダラーも更新
+                    self.sprite_renderer.parse_oam(&self.oam);
                 }
             },
             io_registers::LCDC => self.registers.lcdc = value,
