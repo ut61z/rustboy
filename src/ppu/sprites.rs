@@ -160,6 +160,183 @@ impl SpriteRenderer {
         line_sprites
     }
     
+    /// スプライトタイルの1行分のピクセルデータを取得
+    /// Returns: [color_id; 8] (0=透明, 1-3=パレット色)
+    pub fn render_sprite_line(&self, sprite: &Sprite, scanline: u8, sprite_height: u8, vram: &crate::ppu::vram::Vram) -> [u8; 8] {
+        let mut pixels = [0u8; 8];
+        
+        let sprite_y = sprite.screen_y();
+        let line_in_sprite = scanline as i16 - sprite_y;
+        
+        // スプライト範囲外チェック
+        if line_in_sprite < 0 || line_in_sprite >= sprite_height as i16 {
+            return pixels;
+        }
+        
+        // Y flip処理
+        let actual_line = if sprite.is_y_flipped() {
+            (sprite_height - 1) - line_in_sprite as u8
+        } else {
+            line_in_sprite as u8
+        };
+        
+        // タイルインデックス計算（8x16モード対応）
+        let tile_index = if sprite_height == 16 {
+            // 8x16モード: 偶数インデックス（上半分）、奇数インデックス（下半分）
+            if actual_line < 8 {
+                sprite.tile_index & 0xFE  // 偶数にする
+            } else {
+                sprite.tile_index | 0x01  // 奇数にする
+            }
+        } else {
+            // 8x8モード
+            sprite.tile_index
+        };
+        
+        // タイル内の行計算
+        let tile_line = if sprite_height == 16 {
+            actual_line % 8
+        } else {
+            actual_line
+        };
+        
+        // タイルデータアドレス計算（スプライトは常に$8000-$8FFFから読み込み）
+        let tile_addr = (tile_index as u16) * 16 + (tile_line as u16) * 2;
+        
+        // 2bppタイルデータ読み込み
+        let byte1 = vram.read(tile_addr);
+        let byte2 = vram.read(tile_addr + 1);
+        
+        // 8ピクセル分のデータを展開
+        for x in 0..8 {
+            let bit = 7 - x;
+            let pixel_low = (byte1 >> bit) & 1;
+            let pixel_high = (byte2 >> bit) & 1;
+            let color_id = pixel_low | (pixel_high << 1);
+            
+            // X flip処理
+            let actual_x = if sprite.is_x_flipped() {
+                7 - x
+            } else {
+                x
+            };
+            
+            pixels[actual_x] = color_id;
+        }
+        
+        pixels
+    }
+    
+    /// スプライトの1ピクセルをフレームバッファに描画
+    /// Returns: true if pixel was drawn (not transparent)
+    pub fn draw_sprite_pixel(&self, 
+                           framebuffer: &mut [u8], 
+                           screen_x: usize, 
+                           screen_y: usize, 
+                           color_id: u8, 
+                           palette_number: u8,
+                           obp0: u8, 
+                           obp1: u8) -> bool {
+        // 透明ピクセル（色0）はスキップ
+        if color_id == 0 {
+            return false;
+        }
+        
+        // 画面範囲チェック
+        if screen_x >= 160 || screen_y >= 144 {
+            return false;
+        }
+        
+        // パレット選択
+        let palette = if palette_number == 0 { obp0 } else { obp1 };
+        
+        // パレット色を取得
+        let palette_color = match color_id {
+            1 => (palette >> 2) & 0x03,
+            2 => (palette >> 4) & 0x03,
+            3 => (palette >> 6) & 0x03,
+            _ => 0,
+        };
+        
+        // RGB変換
+        let (r, g, b) = match palette_color {
+            0 => (0x9B, 0xBC, 0x0F),  // 最明色（緑系）
+            1 => (0x8B, 0xAC, 0x0F),  // 明
+            2 => (0x30, 0x62, 0x30),  // 暗
+            3 => (0x0F, 0x38, 0x0F),  // 最暗色
+            _ => (0x9B, 0xBC, 0x0F),
+        };
+        
+        // フレームバッファに書き込み
+        let pixel_index = (screen_y * 160 + screen_x) * 3;
+        if pixel_index + 2 < framebuffer.len() {
+            framebuffer[pixel_index] = r;
+            framebuffer[pixel_index + 1] = g;
+            framebuffer[pixel_index + 2] = b;
+            return true;
+        }
+        
+        false
+    }
+    
+    /// スキャンライン全体のスプライト描画
+    pub fn render_sprites_on_scanline(&self, 
+                                    scanline: u8, 
+                                    sprite_height: u8,
+                                    framebuffer: &mut [u8],
+                                    vram: &crate::ppu::vram::Vram,
+                                    obp0: u8,
+                                    obp1: u8,
+                                    bg_pixels: Option<&[u8; 160]>) -> u8 {
+        let mut sprites_drawn = 0;
+        
+        // 現在のスキャンラインのスプライトを取得
+        let line_sprites = self.find_sprites_on_scanline(scanline, sprite_height);
+        
+        // 逆順で描画（優先度の低いスプライトから先に描画）
+        for (sprite_index, sprite) in line_sprites.iter().rev() {
+            let sprite_pixels = self.render_sprite_line(sprite, scanline, sprite_height, vram);
+            let sprite_screen_x = sprite.screen_x();
+            
+            // スプライトの8ピクセルを描画
+            for (pixel_x, &color_id) in sprite_pixels.iter().enumerate() {
+                let screen_x = sprite_screen_x + pixel_x as i16;
+                
+                // 画面範囲チェック
+                if screen_x < 0 || screen_x >= 160 {
+                    continue;
+                }
+                
+                let screen_x_usize = screen_x as usize;
+                
+                // BG優先度チェック
+                if sprite.has_bg_priority() {
+                    if let Some(bg_pixels) = bg_pixels {
+                        // BG色が0でない場合、スプライトを描画しない
+                        if bg_pixels[screen_x_usize] != 0 {
+                            continue;
+                        }
+                    }
+                }
+                
+                // ピクセル描画
+                if self.draw_sprite_pixel(
+                    framebuffer,
+                    screen_x_usize,
+                    scanline as usize,
+                    color_id,
+                    sprite.palette_number(),
+                    obp0,
+                    obp1
+                ) {
+                    sprites_drawn += 1;
+                }
+            }
+        }
+        
+        sprites_drawn
+    }
+    
     /// デバッグ用：アクティブなスプライトを表示
     pub fn debug_active_sprites(&self) {
         println!("=== Active Sprites ===");
@@ -403,5 +580,127 @@ mod tests {
             assert_eq!(n.1.x, o.1.x);
             assert_eq!(n.1.y, o.1.y);
         }
+    }
+    
+    #[test]
+    fn test_sprite_line_rendering() {
+        let renderer = SpriteRenderer::new();
+        let mut vram = crate::ppu::vram::Vram::new();
+        
+        // テスト用タイルデータ（タイル1）
+        // 簡単なパターン: 上半分が色1、下半分が色2
+        let tile_data = [
+            0xFF, 0x00, // 行0: 11111111, 00000000 -> 全て色1
+            0xFF, 0x00, // 行1: 11111111, 00000000 -> 全て色1
+            0xFF, 0x00, // 行2: 11111111, 00000000 -> 全て色1
+            0xFF, 0x00, // 行3: 11111111, 00000000 -> 全て色1
+            0xFF, 0xFF, // 行4: 11111111, 11111111 -> 全て色3
+            0xFF, 0xFF, // 行5: 11111111, 11111111 -> 全て色3
+            0xFF, 0xFF, // 行6: 11111111, 11111111 -> 全て色3
+            0xFF, 0xFF, // 行7: 11111111, 11111111 -> 全て色3
+        ];
+        
+        // タイル1のデータを書き込み
+        for (i, &byte) in tile_data.iter().enumerate() {
+            vram.write(16 + i as u16, byte); // タイル1は16バイト目から
+        }
+        
+        let sprite = Sprite::from_oam_bytes(&[80, 88, 0x01, 0x00]); // Y=80, X=88, Tile=1, Flags=0
+        
+        // スキャンライン64（スプライト上半分）
+        let pixels = renderer.render_sprite_line(&sprite, 64, 8, &vram);
+        assert_eq!(pixels, [1, 1, 1, 1, 1, 1, 1, 1]); // 全て色1
+        
+        // スキャンライン68（スプライト下半分）
+        let pixels = renderer.render_sprite_line(&sprite, 68, 8, &vram);
+        assert_eq!(pixels, [3, 3, 3, 3, 3, 3, 3, 3]); // 全て色3
+    }
+    
+    #[test]
+    fn test_sprite_x_flip() {
+        let renderer = SpriteRenderer::new();
+        let mut vram = crate::ppu::vram::Vram::new();
+        
+        // テスト用タイルデータ（タイル1）
+        // パターン: 左半分が色1、右半分が色2
+        let tile_data = [
+            0xF0, 0x0F, // 行0: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行1: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行2: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行3: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行4: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行5: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行6: 11110000, 00001111 -> 1111 2222
+            0xF0, 0x0F, // 行7: 11110000, 00001111 -> 1111 2222
+        ];
+        
+        for (i, &byte) in tile_data.iter().enumerate() {
+            vram.write(16 + i as u16, byte);
+        }
+        
+        // 通常スプライト
+        let sprite_normal = Sprite::from_oam_bytes(&[80, 88, 0x01, 0x00]);
+        let pixels_normal = renderer.render_sprite_line(&sprite_normal, 64, 8, &vram);
+        assert_eq!(pixels_normal, [1, 1, 1, 1, 2, 2, 2, 2]);
+        
+        // X flippedスプライト
+        let sprite_flipped = Sprite::from_oam_bytes(&[80, 88, 0x01, 0x20]); // X flip flag
+        let pixels_flipped = renderer.render_sprite_line(&sprite_flipped, 64, 8, &vram);
+        assert_eq!(pixels_flipped, [2, 2, 2, 2, 1, 1, 1, 1]); // 左右反転
+    }
+    
+    #[test]
+    fn test_sprite_y_flip() {
+        let renderer = SpriteRenderer::new();
+        let mut vram = crate::ppu::vram::Vram::new();
+        
+        // テスト用タイルデータ（タイル1）
+        // パターン: 行ごとに異なる色
+        let tile_data = [
+            0xFF, 0x00, // 行0: 色1
+            0x00, 0xFF, // 行1: 色2
+            0xFF, 0xFF, // 行2: 色3
+            0x00, 0x00, // 行3: 色0
+            0xFF, 0x00, // 行4: 色1
+            0x00, 0xFF, // 行5: 色2
+            0xFF, 0xFF, // 行6: 色3
+            0x00, 0x00, // 行7: 色0
+        ];
+        
+        for (i, &byte) in tile_data.iter().enumerate() {
+            vram.write(16 + i as u16, byte);
+        }
+        
+        // 通常スプライト（行0）
+        let sprite_normal = Sprite::from_oam_bytes(&[80, 88, 0x01, 0x00]);
+        let pixels_normal = renderer.render_sprite_line(&sprite_normal, 64, 8, &vram);
+        assert_eq!(pixels_normal, [1, 1, 1, 1, 1, 1, 1, 1]); // 行0 = 色1
+        
+        // Y flippedスプライト（行0だが実際は行7）
+        let sprite_flipped = Sprite::from_oam_bytes(&[80, 88, 0x01, 0x40]); // Y flip flag
+        let pixels_flipped = renderer.render_sprite_line(&sprite_flipped, 64, 8, &vram);
+        assert_eq!(pixels_flipped, [0, 0, 0, 0, 0, 0, 0, 0]); // 行7 = 色0
+    }
+    
+    #[test]
+    fn test_sprite_pixel_drawing() {
+        let renderer = SpriteRenderer::new();
+        let mut framebuffer = [0u8; 160 * 144 * 3];
+        
+        // テスト用パレット
+        let obp0 = 0xE4; // 11 10 01 00
+        let obp1 = 0x1B; // 00 01 10 11
+        
+        // パレット0、色1を描画
+        assert!(renderer.draw_sprite_pixel(&mut framebuffer, 10, 20, 1, 0, obp0, obp1));
+        
+        // RGB値を確認（パレット0の色1 = (obp0 >> 2) & 0x03 = 1）
+        let pixel_index = (20 * 160 + 10) * 3;
+        assert_eq!(framebuffer[pixel_index], 0x8B);     // R
+        assert_eq!(framebuffer[pixel_index + 1], 0xAC); // G
+        assert_eq!(framebuffer[pixel_index + 2], 0x0F); // B
+        
+        // 透明ピクセル（色0）は描画されない
+        assert!(!renderer.draw_sprite_pixel(&mut framebuffer, 11, 20, 0, 0, obp0, obp1));
     }
 }
