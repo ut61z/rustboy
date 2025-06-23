@@ -5,9 +5,11 @@ use std::fs;
 mod memory_map;      // メモリマップ定義
 mod memory;          // メモリコンポーネント
 mod peripherals;     // メモリバス
+mod cpu;             // CPUコンポーネント
 
 use memory::BootRom;
 use peripherals::Peripherals;
+use cpu::Cpu;
 
 // メモリマップモジュールから関数をインポート
 use memory_map::{
@@ -93,7 +95,10 @@ fn test_memory_system(bootrom: BootRom) {
     // 6. 統計情報表示
     show_statistics(&peripherals);
     
-    println!("\n=== Phase 2 テスト完了 ===");
+    // 7. Phase 3: CPU テスト
+    test_cpu_system(&mut peripherals);
+    
+    println!("\n=== Phase 2 + Phase 3 テスト完了 ===");
 }
 
 fn test_address_info() {
@@ -238,4 +243,140 @@ fn demo_memory_map() {
     for &addr in &boundary_addresses {
         println!("  {}", get_address_info(addr));
     }
+}
+
+fn test_cpu_system(peripherals: &mut Peripherals) {
+    println!("\n=== Phase 3: CPU システムテスト ===");
+    
+    let mut cpu = Cpu::new();
+    
+    // CPUレジスタテスト
+    test_cpu_registers(&mut cpu);
+    
+    // 基本命令テスト
+    test_basic_instructions(&mut cpu, peripherals);
+    
+    // 簡単なプログラム実行テスト
+    test_simple_program(&mut cpu, peripherals);
+    
+    println!("=== CPU テスト完了 ===");
+}
+
+fn test_cpu_registers(cpu: &mut Cpu) {
+    println!("\n--- CPUレジスタテスト ---");
+    
+    // 初期状態確認
+    println!("初期状態: {}", cpu.debug_string());
+    
+    // レジスタペア操作テスト
+    cpu.registers.set_af(0x1234);
+    cpu.registers.set_bc(0x5678);
+    cpu.registers.set_de(0x9ABC);
+    cpu.registers.set_hl(0xDEF0);
+    cpu.registers.sp = 0xFFFE;
+    cpu.registers.pc = 0x0100;
+    
+    println!("設定後: {}", cpu.debug_string());
+    
+    // フラグテスト
+    cpu.registers.set_flags(true, false, true, false);
+    println!("フラグ: {}", cpu.registers.flags_string());
+    
+    assert_eq!(cpu.registers.af(), 0x12A0); // フラグの下位4bitはマスク
+    assert_eq!(cpu.registers.bc(), 0x5678);
+    assert_eq!(cpu.registers.de(), 0x9ABC);
+    assert_eq!(cpu.registers.hl(), 0xDEF0);
+    
+    println!("✓ レジスタテスト成功");
+}
+
+fn test_basic_instructions(cpu: &mut Cpu, peripherals: &mut Peripherals) {
+    println!("\n--- 基本命令テスト ---");
+    
+    // CPUリセット
+    cpu.reset();
+    
+    // テストプログラムをWRAM領域に配置
+    let test_program = [
+        0x00,       // NOP
+        0x3E, 0x42, // LD A, 0x42
+        0x06, 0x24, // LD B, 0x24
+        0x31, 0xFE, 0xFF, // LD SP, 0xFFFE
+        0x00,       // NOP
+    ];
+    
+    cpu.registers.pc = 0xC000; // WRAMの開始アドレスから実行
+    for (i, &byte) in test_program.iter().enumerate() {
+        peripherals.write(0xC000 + i as u16, byte);
+    }
+    
+    println!("初期状態: {}", cpu.debug_string());
+    
+    // 命令を順次実行
+    for i in 0..5 {
+        match cpu.step(peripherals) {
+            Ok(cycles) => {
+                println!("命令{}: {} ({}cycles)", i + 1, cpu.debug_string(), cycles);
+            }
+            Err(e) => {
+                eprintln!("命令実行エラー: {}", e);
+                break;
+            }
+        }
+    }
+    
+    // 結果確認
+    assert_eq!(cpu.registers.a, 0x42);
+    assert_eq!(cpu.registers.b, 0x24);
+    assert_eq!(cpu.registers.sp, 0xFFFE);
+    assert_eq!(cpu.instruction_count, 5);
+    
+    println!("✓ 基本命令テスト成功");
+}
+
+fn test_simple_program(cpu: &mut Cpu, peripherals: &mut Peripherals) {
+    println!("\n--- 簡単なプログラム実行テスト ---");
+    
+    cpu.reset();
+    
+    // 簡単なループプログラムをWRAM領域に配置
+    let program = [
+        0x3E, 0x01,       // LD A, 1        (PC: 0xC000-0xC001)
+        0x06, 0x05,       // LD B, 5        (PC: 0xC002-0xC003)
+        0x00,             // NOP            (PC: 0xC004)
+        0x18, 0xFD,       // JR -3          (PC: 0xC005-0xC006) -> 0xC004
+        0x00,             // NOP (到達しない)
+    ];
+    
+    cpu.registers.pc = 0xC000; // WRAMの開始アドレスから実行
+    for (i, &byte) in program.iter().enumerate() {
+        peripherals.write(0xC000 + i as u16, byte);
+    }
+    
+    println!("プログラム実行開始: {}", cpu.debug_string());
+    
+    // 最大10命令実行（無限ループ防止）
+    for i in 0..10 {
+        match cpu.step(peripherals) {
+            Ok(cycles) => {
+                println!("実行{}: {} ({}cycles)", i + 1, cpu.debug_string(), cycles);
+                
+                // 0xC004-0xC006のループに入ったら停止
+                if cpu.registers.pc == 0xC004 && i > 5 {
+                    println!("ループ検出、テスト終了");
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("実行エラー: {}", e);
+                break;
+            }
+        }
+    }
+    
+    // レジスタ値確認
+    assert_eq!(cpu.registers.a, 0x01);
+    assert_eq!(cpu.registers.b, 0x05);
+    
+    println!("✓ プログラム実行テスト成功");
 }
