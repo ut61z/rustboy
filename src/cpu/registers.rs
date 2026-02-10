@@ -103,8 +103,18 @@ impl Registers {
         self.l = value as u8;
     }
     
+    // get_xxx エイリアス（CPU命令実装から使用）
+    pub fn get_af(&self) -> u16 { self.af() }
+    pub fn get_bc(&self) -> u16 { self.bc() }
+    pub fn get_de(&self) -> u16 { self.de() }
+    pub fn get_hl(&self) -> u16 { self.hl() }
+
+    /// フラグ簡易アクセサ（CPU命令実装から使用）
+    pub fn get_flag_z(&self) -> bool { self.zero_flag() }
+    pub fn get_flag_c(&self) -> bool { self.carry_flag() }
+
     /// フラグ操作
-    
+
     /// Zero flag を取得
     pub fn zero_flag(&self) -> bool {
         (self.f & flags::ZERO) != 0
