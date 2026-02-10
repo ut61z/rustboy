@@ -11,6 +11,8 @@ mod simple_display;  // 簡易ASCII表示
 mod joypad;          // ジョイパッド入力
 mod dma;             // DMA転送コントローラ
 mod cartridge;       // カートリッジ・MBCシステム
+mod serial;          // シリアル通信
+mod apu;             // APU（音声処理ユニット）
 
 #[cfg(feature = "with_sdl")]
 mod lcd;             // LCDディスプレイ

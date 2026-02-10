@@ -4,7 +4,7 @@
 
 ## プロジェクト概要
 
-RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウェア精確なエミュレーションを目指し、段階的に開発中。現在Phase 6（スプライト・ウィンドウ・DMA・ジョイパッド・カートリッジ/MBC1）まで完了、127テスト全パス。
+RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウェア精確なエミュレーションを目指し、段階的に開発中。現在Phase 7（APU・シリアル通信・MBC2/3/5）まで完了、198テスト全パス。
 
 ## 環境設定
 
@@ -17,7 +17,7 @@ RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウ�
 ### ビルドと実行
 ```bash
 cargo check                           # 高速コンパイルチェック（ビルドなし）
-cargo test                            # 全127テストを実行
+cargo test                            # 全198テストを実行
 cargo test -- --nocapture             # テスト出力を表示して実行
 cargo run                             # ダミーBootROMで実行（PPUとLCDテスト含む）
 cargo run <bootrom_file>              # 実際のBootROMファイルで実行
@@ -52,7 +52,8 @@ rustboy/
     ├── peripherals.rs          # メモリバス・アドレスデコード（全周辺機器統合）
     ├── joypad.rs               # ジョイパッド入力（方向キー/ボタンキー、割り込み）
     ├── dma.rs                  # OAM DMA転送コントローラ（160バイト転送）
-    ├── cartridge.rs            # カートリッジ・MBCシステム（ROM ONLY/MBC1対応）
+    ├── cartridge.rs            # カートリッジ・MBCシステム（ROM ONLY/MBC1/MBC2/MBC3/MBC5対応）
+    ├── serial.rs               # シリアル通信（SB/SCレジスタ、内部クロック転送、割り込み）
     ├── lcd.rs                  # SDL2 LCD表示（with_sdl機能フラグ）
     ├── simple_display.rs       # ASCIIフォールバック表示
     ├── memory/
@@ -67,14 +68,19 @@ rustboy/
     │   ├── decoder.rs          # 命令デコーダ
     │   ├── interrupts.rs       # 割り込みコントローラ（VBlank/STAT/Timer/Serial/Joypad）
     │   └── timer.rs            # タイマーシステム（DIV/TIMA/TMA/TAC）
-    └── ppu/
-        ├── mod.rs              # PPUコア（Mode 0-3遷移、BG/ウィンドウ/スプライト描画）
-        ├── registers.rs        # LCDレジスタ（LCDC, STAT, SCY, SCX, LY, LYC, BGP, OBP0/1, WY, WX）
-        ├── vram.rs             # VRAM（8KB、タイルデータ/マップアクセス）
-        ├── tiles.rs            # タイルレンダリング（キャッシュ、パレット変換）
-        ├── background.rs       # 背景描画（スクロール、折り返し対応）
-        ├── sprites.rs          # スプライト描画（OAMスキャン、8x8/8x16、優先度、反転）
-        └── timing.rs           # PPUタイミング定数
+    ├── ppu/
+    │   ├── mod.rs              # PPUコア（Mode 0-3遷移、BG/ウィンドウ/スプライト描画）
+    │   ├── registers.rs        # LCDレジスタ（LCDC, STAT, SCY, SCX, LY, LYC, BGP, OBP0/1, WY, WX）
+    │   ├── vram.rs             # VRAM（8KB、タイルデータ/マップアクセス）
+    │   ├── tiles.rs            # タイルレンダリング（キャッシュ、パレット変換）
+    │   ├── background.rs       # 背景描画（スクロール、折り返し対応）
+    │   ├── sprites.rs          # スプライト描画（OAMスキャン、8x8/8x16、優先度、反転）
+    │   └── timing.rs           # PPUタイミング定数
+    └── apu/
+        ├── mod.rs              # APUコア（フレームシーケンサ、ミキサー、レジスタI/O）
+        ├── pulse.rs            # パルスチャンネル（デューティサイクル、スイープ、エンベロープ）
+        ├── wave.rs             # ウェーブチャンネル（Wave RAM、出力レベル）
+        └── noise.rs            # ノイズチャンネル（LFSR、多項式カウンタ）
 ```
 
 ## アーキテクチャ
@@ -91,7 +97,9 @@ main.rs
   │     ├── Timer (DIV/TIMA/TMA/TAC)
   │     ├── Joypad (方向キー/ボタンキー入力)
   │     ├── Dma (OAM DMA転送コントローラ)
-  │     ├── Cartridge (ROM/RAM/MBC1バンク切り替え)
+  │     ├── Cartridge (ROM/RAM/MBC1/MBC2/MBC3/MBC5バンク切り替え)
+  │     ├── Serial (シリアル通信SB/SC)
+  │     ├── Apu (4チャンネル音声処理)
   │     ├── interrupt_flag (IF: 0xFF0F)
   │     └── interrupt_enable (IE: 0xFFFF)
   ├── Cpu
@@ -102,10 +110,12 @@ main.rs
   └── Display (lcd.rs / simple_display.rs)
 ```
 
-### 入力・DMA・カートリッジ
+### 入力・DMA・カートリッジ・シリアル・APU
 - **Joypad** (`src/joypad.rs`) — ジョイパッド入力。方向キー/ボタンキーの2グループ選択式。P14/P15ビットで選択、High→Low遷移で割り込み要求
 - **DMA** (`src/dma.rs`) — OAM DMA転送コントローラ。0xFF46書き込みで転送開始、160バイトを640Tサイクルで転送
-- **Cartridge** (`src/cartridge.rs`) — カートリッジROM/RAM管理。ROM ONLY/MBC1/MBC1+RAM/MBC1+RAM+BATTERY対応。ROMバンク切り替え（5bit）、RAMバンク切り替え（2bit）、バンキングモード（ROM/RAM）
+- **Cartridge** (`src/cartridge.rs`) — カートリッジROM/RAM管理。ROM ONLY/MBC1/MBC2/MBC3/MBC5対応。MBC3にはRTC（リアルタイムクロック）含む
+- **Serial** (`src/serial.rs`) — シリアル通信。SB（データ）/SC（制御）レジスタ。内部クロック8192Hz、8ビット転送完了で割り込み要求
+- **APU** (`src/apu/`) — 4チャンネル音声処理ユニット。Channel 1/2（パルス波、スイープ/エンベロープ）、Channel 3（ウェーブテーブル）、Channel 4（ノイズLFSR）。512Hzフレームシーケンサ、ダウンサンプリング付きステレオミキサー
 
 ### メモリシステム
 - **Peripherals** (`src/peripherals.rs`) — メインメモリバス。PPU/Timer/Joypad/DMA/Cartridgeを統合し、`tick(cycles)`でCPUサイクルに同期して全周辺機器を駆動
@@ -140,9 +150,9 @@ main.rs
 | アドレス範囲 | サイズ | 用途 | 実装状況 |
 |---|---|---|---|
 | 0x0000-0x00FF | 256B | BootROM（0xFF50で無効化） | ✅ |
-| 0x0100-0x7FFF | 32KB | カートリッジROM | ✅ ROM ONLY/MBC1対応 |
+| 0x0100-0x7FFF | 32KB | カートリッジROM | ✅ ROM ONLY/MBC1/MBC2/MBC3/MBC5対応 |
 | 0x8000-0x9FFF | 8KB | VRAM（タイルデータ+タイルマップ） | ✅ |
-| 0xA000-0xBFFF | 8KB | カートリッジRAM | ✅ MBC1 RAM対応 |
+| 0xA000-0xBFFF | 8KB | カートリッジRAM | ✅ MBC1/MBC2/MBC3/MBC5 RAM対応 |
 | 0xC000-0xDFFF | 8KB | Work RAM | ✅ |
 | 0xE000-0xFDFF | — | WRAMエコー（ミラー） | ✅ |
 | 0xFE00-0xFE9F | 160B | OAM（スプライト属性） | ✅ メモリバス統合済み |
@@ -179,9 +189,9 @@ main.rs
 
 ## テスト戦略
 
-全127テスト。各モジュールにユニットテストを内蔵：
+全198テスト。各モジュールにユニットテストを内蔵：
 - **メモリ**: BootROM読み書き・無効化、WRAM読み書き・アドレス変換、HRAM読み書き・境界値
-- **メモリバス**: Peripherals統合テスト（BootROM/WRAM/HRAM/VRAM/OAM/PPUレジスタ/割り込みレジスタ/VBlank tick/Joypad/DMA/OBP/カートリッジ）
+- **メモリバス**: Peripherals統合テスト（BootROM/WRAM/HRAM/VRAM/OAM/PPUレジスタ/割り込みレジスタ/VBlank tick/Joypad/DMA/OBP/カートリッジ/Serial/APU）
 - **メモリマップ**: 領域判定、アドレス情報取得、I/Oレジスタ名解決
 - **CPU**: レジスタ、フラグ、命令デコード、LD/ALU/PUSH/POP/CALL/RET/JR/CB/LDH/ローテート/割り込み/HALT復帰
 - **割り込み**: マスク、ハンドラアドレス、優先順位、IE&IFフィルタ
@@ -190,7 +200,12 @@ main.rs
 - **スプライト**: OAMエントリ解析、フラグ判定、スキャンライン判定（8×8/8×16）、OAMスキャン上限・ソート、透明色、基本描画
 - **ジョイパッド**: 初期化、方向キー/ボタンキー選択、ボタン押下/離し、グループ分離、割り込み発生、未選択状態
 - **DMA**: 初期化、転送開始、転送アドレス、転送完了、非アクティブ状態
-- **カートリッジ**: ROM ONLY読み取り、ヘッダ解析、MBC1バンク切り替え、バンク0リダイレクト、MBC1 RAM有効/無効、サイズ検証
+- **カートリッジ**: ROM ONLY読み取り、ヘッダ解析、MBC1バンク切り替え/RAM、MBC2バンク切り替え/4bit RAM/アドレスbit8、MBC3バンク切り替え/RAMバンキング/RTCラッチ/RTC tick/RTC停止、MBC5バンク切り替え/9bit ROM/RAMバンキング/バンク0許可、タイプ検出
+- **シリアル**: 初期化、SB読み書き、SC未使用ビット、転送開始、外部クロック、転送完了・割り込み、未接続受信、非アクティブ
+- **APU**: 初期化、電源オン/オフ、NR52読み取り、チャンネルトリガー、NR50/NR51レジスタ、Wave RAM保持/アクセス、電源オフ時ロック、tick/サンプル生成、フレームシーケンサ長さ
+- **APUパルス**: 初期化、スイープ有無、デューティ/長さレジスタ、エンベロープ、DAC無効化、トリガー、長さカウンタ、スイープレジスタ、周波数書き込み、出力
+- **APUウェーブ**: 初期化、DACレジスタ、出力レベル、Wave RAM読み書き、トリガー、長さカウンタ、出力レベル段階
+- **APUノイズ**: 初期化、長さ、エンベロープ、多項式、幅モード、トリガー、長さカウンタ、LFSRシフト
 - **表示**: SimpleDisplay生成、色変換、FPSカウンタ
 
 ## 現在の実装状況
@@ -202,7 +217,8 @@ main.rs
 | Phase 4 | PPU・LCD表示 | ✅ 完了 |
 | Phase 5 | メモリバス統合・割り込み・タイマー・CPU命令拡張（500命令） | ✅ 完了 |
 | Phase 6 | スプライト・ウィンドウ・DMA・ジョイパッド・カートリッジ/MBC1 | ✅ 完了 |
-| Phase 7+ | APU（音声）、MBC2/3/5、シリアル通信 | 🔲 未着手 |
+| Phase 7 | APU（音声4ch）・シリアル通信・MBC2/MBC3(RTC)/MBC5 | ✅ 完了 |
+| Phase 8+ | SDL2オーディオ出力、MBC3 BATTERY永続化、デバッガ | 🔲 未着手 |
 
 ## 開発ガイドライン
 
