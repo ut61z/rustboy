@@ -11,6 +11,8 @@ use crate::cpu::timer::Timer;
 use crate::joypad::Joypad;
 use crate::dma::Dma;
 use crate::cartridge::Cartridge;
+use crate::serial::Serial;
+use crate::apu::Apu;
 
 pub struct Peripherals {
     bootrom: BootRom,
@@ -21,6 +23,8 @@ pub struct Peripherals {
     pub joypad: Joypad,
     pub dma: Dma,
     pub cartridge: Option<Cartridge>,
+    pub serial: Serial,
+    pub apu: Apu,
 
     // 割り込みレジスタ
     pub interrupt_flag: u8,     // IF (0xFF0F)
@@ -43,6 +47,8 @@ impl Peripherals {
             joypad: Joypad::new(),
             dma: Dma::new(),
             cartridge: None,
+            serial: Serial::new(),
+            apu: Apu::new(),
             interrupt_flag: 0x00,
             interrupt_enable: 0x00,
             read_count: 0,
@@ -60,11 +66,18 @@ impl Peripherals {
         self.cartridge = Some(cartridge);
     }
 
-    /// CPUサイクルに同期してPPU/Timer/DMAを進める
+    /// CPUサイクルに同期してPPU/Timer/DMA/Serial/APU/Cartridgeを進める
     pub fn tick(&mut self, cycles: u8) {
         for _ in 0..cycles {
             self.ppu.step();
             self.timer.tick();
+            self.serial.tick();
+            self.apu.tick();
+
+            // カートリッジRTCティック
+            if let Some(ref mut cart) = self.cartridge {
+                cart.tick();
+            }
 
             // DMA転送処理
             if let Some((src, dst)) = self.dma.tick() {
@@ -90,6 +103,12 @@ impl Peripherals {
         if self.timer.interrupt_request {
             self.interrupt_flag |= 0x04; // Timer割り込み (bit 2)
             self.timer.interrupt_request = false;
+        }
+
+        // Serialの割り込みフラグをIFに反映
+        if self.serial.interrupt_request {
+            self.interrupt_flag |= 0x08; // Serial割り込み (bit 3)
+            self.serial.interrupt_request = false;
         }
 
         // Joypadの割り込みフラグをIFに反映
@@ -221,6 +240,10 @@ impl Peripherals {
             // ジョイパッド
             JOYP => self.joypad.read(),
 
+            // シリアル通信
+            SB => self.serial.read_sb(),
+            SC => self.serial.read_sc(),
+
             // PPUレジスタ
             LCDC => self.ppu.registers.lcdc,
             STAT => {
@@ -245,6 +268,9 @@ impl Peripherals {
             TIMA => self.timer.tima,
             TMA => self.timer.tma,
             TAC => self.timer.tac | 0xF8, // 上位5bitは常に1
+
+            // APUレジスタ + Wave RAM
+            NR10..=NR52 | WAVE_RAM_START..=WAVE_RAM_END => self.apu.read(addr),
 
             // 割り込みフラグ
             IF => self.interrupt_flag | 0xE0, // 上位3bitは常に1
@@ -337,6 +363,10 @@ impl Peripherals {
             // ジョイパッド
             JOYP => self.joypad.write(value),
 
+            // シリアル通信
+            SB => self.serial.write_sb(value),
+            SC => self.serial.write_sc(value),
+
             // PPUレジスタ
             LCDC => self.ppu.registers.lcdc = value,
             STAT => {
@@ -359,6 +389,9 @@ impl Peripherals {
             TIMA => self.timer.tima = value,
             TMA => self.timer.tma = value,
             TAC => self.timer.tac = value & 0x07,
+
+            // APUレジスタ + Wave RAM
+            NR10..=NR52 | WAVE_RAM_START..=WAVE_RAM_END => self.apu.write(addr, value),
 
             // 割り込みフラグ
             IF => {
@@ -727,5 +760,62 @@ mod tests {
 
         // Joypad割り込みがIFに反映
         assert_ne!(peripherals.interrupt_flag & 0x10, 0);
+    }
+
+    #[test]
+    fn test_peripherals_serial() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // SBレジスタ書き込み・読み取り
+        peripherals.write(0xFF01, 0x42);
+        assert_eq!(peripherals.read(0xFF01), 0x42);
+
+        // SCレジスタ書き込み・読み取り
+        peripherals.write(0xFF02, 0x81);
+        assert_eq!(peripherals.read(0xFF02) & 0x81, 0x81);
+    }
+
+    #[test]
+    fn test_peripherals_serial_interrupt() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        peripherals.write(0xFF01, 0xAB);
+        peripherals.write(0xFF02, 0x81); // 内部クロックで転送開始
+
+        // 転送完了まで（4096サイクル）
+        for _ in 0..4096 {
+            peripherals.tick(1);
+        }
+
+        // Serial割り込みがIFに反映
+        assert_ne!(peripherals.interrupt_flag & 0x08, 0);
+    }
+
+    #[test]
+    fn test_peripherals_apu_registers() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // NR52でAPU電源オン
+        peripherals.write(0xFF26, 0x80);
+        assert_eq!(peripherals.read(0xFF26) & 0x80, 0x80);
+
+        // NR50 マスター音量
+        peripherals.write(0xFF24, 0x77);
+        assert_eq!(peripherals.read(0xFF24), 0x77);
+
+        // NR51 パニング
+        peripherals.write(0xFF25, 0xFF);
+        assert_eq!(peripherals.read(0xFF25), 0xFF);
+    }
+
+    #[test]
+    fn test_peripherals_apu_wave_ram() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // Wave RAM書き込み（APU電源に関係なく可能）
+        peripherals.write(0xFF30, 0x12);
+        peripherals.write(0xFF3F, 0xAB);
+        assert_eq!(peripherals.read(0xFF30), 0x12);
+        assert_eq!(peripherals.read(0xFF3F), 0xAB);
     }
 }
