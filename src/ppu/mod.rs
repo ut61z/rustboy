@@ -3,6 +3,7 @@ pub mod timing;
 pub mod vram;
 pub mod tiles;
 pub mod background;
+pub mod sprites;
 
 use crate::memory_map::{dmg, io_registers};
 
@@ -18,15 +19,21 @@ pub struct Ppu {
     pub registers: registers::PpuRegisters,
     pub vram: vram::Vram,
     pub oam: [u8; 160],  // Object Attribute Memory
-    
+
     // PPU状態
     pub mode: PpuMode,
     pub cycles: u32,
     pub scanline: u8,
-    
+
+    // ウィンドウ内部ラインカウンタ（フレーム内でウィンドウが描画された行数）
+    pub window_line_counter: u8,
+
     // 描画バッファ
     pub framebuffer: [u8; 160 * 144 * 3],  // RGB888形式
-    
+
+    // BG色ID配列（スプライト優先度判定用）
+    bg_color_ids: [u8; 160],
+
     // フラグ
     pub vblank_interrupt: bool,
     pub stat_interrupt: bool,
@@ -38,13 +45,16 @@ impl Ppu {
             registers: registers::PpuRegisters::new(),
             vram: vram::Vram::new(),
             oam: [0; 160],
-            
+
             mode: PpuMode::OamScan,
             cycles: 0,
             scanline: 0,
-            
+
+            window_line_counter: 0,
+
             framebuffer: [0; 160 * 144 * 3],
-            
+            bg_color_ids: [0; 160],
+
             vblank_interrupt: false,
             stat_interrupt: false,
         }
@@ -98,6 +108,7 @@ impl Ppu {
                     if self.scanline >= 154 {
                         // フレーム完了、新しいフレーム開始
                         self.scanline = 0;
+                        self.window_line_counter = 0;
                         self.mode = PpuMode::OamScan;
                     }
                 }
@@ -110,99 +121,172 @@ impl Ppu {
         false
     }
     
-    // スキャンライン描画（改良版）
+    // スキャンライン描画（BG + ウィンドウ + スプライト）
     fn draw_scanline(&mut self) {
-        if !self.registers.is_bg_enabled() {
-            // BG無効時は白で塗りつぶし
-            let y = self.scanline as usize;
-            if y < 144 {
-                for x in 0..160 {
-                    let pixel_index = (y * 160 + x) * 3;
-                    self.framebuffer[pixel_index] = 0x9B;     // R (最明色)
-                    self.framebuffer[pixel_index + 1] = 0xBC; // G
-                    self.framebuffer[pixel_index + 2] = 0x0F; // B
-                }
-            }
-            return;
-        }
-        
         let y = self.scanline as usize;
         if y >= 144 {
             return;
         }
-        
-        // スクロール補正されたY座標
-        let bg_y = (y as u8).wrapping_add(self.registers.scy);
-        let tile_y = bg_y / 8;          // タイル行
-        let pixel_y = bg_y % 8;         // タイル内Y座標
-        
-        // タイルマップ選択
-        let tilemap_base = if self.registers.is_bg_tilemap_high() {
-            0x1C00  // $9C00-$9FFF
+
+        // BG色ID配列をクリア
+        self.bg_color_ids = [0; 160];
+
+        if !self.registers.is_bg_enabled() {
+            // BG無効時は白で塗りつぶし
+            for x in 0..160 {
+                let pixel_index = (y * 160 + x) * 3;
+                self.framebuffer[pixel_index] = 0x9B;     // R (最明色)
+                self.framebuffer[pixel_index + 1] = 0xBC; // G
+                self.framebuffer[pixel_index + 2] = 0x0F; // B
+            }
         } else {
-            0x1800  // $9800-$9BFF
+            // 背景描画
+            self.draw_bg_scanline(y);
+
+            // ウィンドウ描画
+            self.draw_window_scanline(y);
+        }
+
+        // スプライト描画
+        let start = y * 160 * 3;
+        let end = start + 160 * 3;
+        sprites::SpriteRenderer::render_scanline(
+            &self.oam,
+            &self.vram,
+            &self.registers,
+            self.scanline,
+            &self.bg_color_ids,
+            &mut self.framebuffer[start..end],
+        );
+    }
+
+    // 背景スキャンライン描画
+    fn draw_bg_scanline(&mut self, y: usize) {
+        let bg_y = (y as u8).wrapping_add(self.registers.scy);
+        let tile_y = bg_y / 8;
+        let pixel_y = bg_y % 8;
+
+        let tilemap_base = if self.registers.is_bg_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
         };
-        
-        // タイルデータアドレス指定モード
+
         let tiledata_mode = self.registers.is_bg_window_tiledata_high();
-        
-        // 160ピクセルを描画
+
         for x in 0..160 {
-            // スクロール補正されたX座標
             let bg_x = (x as u8).wrapping_add(self.registers.scx);
-            let tile_x = bg_x / 8;          // タイル列
-            let pixel_x_in_tile = bg_x % 8; // タイル内X座標
-            
-            // タイルIDを取得
+            let tile_x = bg_x / 8;
+            let pixel_x_in_tile = bg_x % 8;
+
             let tile_map_addr = tilemap_base + (tile_y as u16) * 32 + (tile_x as u16);
             let tile_id = self.vram.read(tile_map_addr);
-            
-            // タイルデータアドレス計算
-            let tile_data_addr = if tiledata_mode {
-                // $8000-$8FFF (unsigned 0-255)
-                (tile_id as u16) * 16
-            } else {
-                // $8800-$97FF (signed -128 to 127)
-                if tile_id < 128 {
-                    0x1000 + (tile_id as u16) * 16  // $9000 + tile_id * 16
-                } else {
-                    0x0800 + ((tile_id as u16 - 128) * 16)  // $8800 + (tile_id - 128) * 16
-                }
-            };
-            
-            // ピクセルデータを取得（2bpp）
+
+            let tile_data_addr = Self::calc_tile_data_addr(tile_id, tiledata_mode);
+
             let byte1 = self.vram.read(tile_data_addr + pixel_y as u16 * 2);
             let byte2 = self.vram.read(tile_data_addr + pixel_y as u16 * 2 + 1);
-            
-            // ピクセル値を計算
+
             let bit = 7 - pixel_x_in_tile;
             let pixel_low = (byte1 >> bit) & 1;
             let pixel_high = (byte2 >> bit) & 1;
             let color_id = pixel_low | (pixel_high << 1);
-            
-            // パレット適用
-            let palette_color = match color_id {
-                0 => self.registers.bgp & 0x03,
-                1 => (self.registers.bgp >> 2) & 0x03,
-                2 => (self.registers.bgp >> 4) & 0x03,
-                3 => (self.registers.bgp >> 6) & 0x03,
-                _ => 0,
-            };
-            
-            // RGB変換
-            let (r, g, b) = match palette_color {
-                0 => (0x9B, 0xBC, 0x0F),  // 最明色（緑系）
-                1 => (0x8B, 0xAC, 0x0F),  // 明
-                2 => (0x30, 0x62, 0x30),  // 暗
-                3 => (0x0F, 0x38, 0x0F),  // 最暗色
-                _ => (0x9B, 0xBC, 0x0F),
-            };
-            
-            // フレームバッファに書き込み
+
+            // BG色IDを保存（スプライト優先度判定用）
+            self.bg_color_ids[x] = color_id;
+
+            let palette_color = self.registers.get_bg_palette_color(color_id);
+            let (r, g, b) = tiles::ColorConverter::dmg_to_rgb888(palette_color);
+
             let pixel_index = (y * 160 + x) * 3;
             self.framebuffer[pixel_index] = r;
             self.framebuffer[pixel_index + 1] = g;
             self.framebuffer[pixel_index + 2] = b;
+        }
+    }
+
+    // ウィンドウスキャンライン描画
+    fn draw_window_scanline(&mut self, y: usize) {
+        if !self.registers.is_window_enabled() {
+            return;
+        }
+
+        let wy = self.registers.wy;
+        let wx = self.registers.wx;
+
+        // WXは画面X + 7 の値
+        if wx > 166 || wy > 143 {
+            return;
+        }
+
+        // 現在のスキャンラインがウィンドウ開始Y以降か
+        if (y as u8) < wy {
+            return;
+        }
+
+        let window_x_start = if wx < 7 { 0 } else { (wx - 7) as usize };
+
+        let tilemap_base = if self.registers.is_window_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
+        };
+
+        let tiledata_mode = self.registers.is_bg_window_tiledata_high();
+        let window_line = self.window_line_counter;
+        let tile_y = window_line / 8;
+        let pixel_y = window_line % 8;
+
+        let mut window_drawn = false;
+
+        for x in window_x_start..160 {
+            let window_x = (x - window_x_start) as u8;
+            let tile_x = window_x / 8;
+            let pixel_x_in_tile = window_x % 8;
+
+            let tile_map_addr = tilemap_base + (tile_y as u16) * 32 + (tile_x as u16);
+            let tile_id = self.vram.read(tile_map_addr);
+
+            let tile_data_addr = Self::calc_tile_data_addr(tile_id, tiledata_mode);
+
+            let byte1 = self.vram.read(tile_data_addr + pixel_y as u16 * 2);
+            let byte2 = self.vram.read(tile_data_addr + pixel_y as u16 * 2 + 1);
+
+            let bit = 7 - pixel_x_in_tile;
+            let pixel_low = (byte1 >> bit) & 1;
+            let pixel_high = (byte2 >> bit) & 1;
+            let color_id = pixel_low | (pixel_high << 1);
+
+            // ウィンドウ部分のBG色IDを更新
+            self.bg_color_ids[x] = color_id;
+
+            let palette_color = self.registers.get_bg_palette_color(color_id);
+            let (r, g, b) = tiles::ColorConverter::dmg_to_rgb888(palette_color);
+
+            let pixel_index = (y * 160 + x) * 3;
+            self.framebuffer[pixel_index] = r;
+            self.framebuffer[pixel_index + 1] = g;
+            self.framebuffer[pixel_index + 2] = b;
+
+            window_drawn = true;
+        }
+
+        // ウィンドウが実際に描画された場合のみカウンタをインクリメント
+        if window_drawn {
+            self.window_line_counter += 1;
+        }
+    }
+
+    // タイルデータアドレス計算
+    fn calc_tile_data_addr(tile_id: u8, unsigned_mode: bool) -> u16 {
+        if unsigned_mode {
+            (tile_id as u16) * 16
+        } else {
+            if tile_id < 128 {
+                0x1000 + (tile_id as u16) * 16
+            } else {
+                0x0800 + ((tile_id as u16 - 128) * 16)
+            }
         }
     }
     

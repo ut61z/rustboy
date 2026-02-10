@@ -4,7 +4,7 @@
 
 ## プロジェクト概要
 
-RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウェア精確なエミュレーションを目指し、段階的に開発中。現在Phase 5（メモリバス統合・割り込み・タイマー・CPU命令拡張）まで完了、93テスト全パス。
+RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウェア精確なエミュレーションを目指し、段階的に開発中。現在Phase 6（スプライト・ウィンドウ・DMA・ジョイパッド・カートリッジ/MBC1）まで完了、127テスト全パス。
 
 ## 環境設定
 
@@ -17,7 +17,7 @@ RustBoy — Rustで書かれたGameBoy (DMG) エミュレータ。ハードウ�
 ### ビルドと実行
 ```bash
 cargo check                           # 高速コンパイルチェック（ビルドなし）
-cargo test                            # 全58テストを実行
+cargo test                            # 全127テストを実行
 cargo test -- --nocapture             # テスト出力を表示して実行
 cargo run                             # ダミーBootROMで実行（PPUとLCDテスト含む）
 cargo run <bootrom_file>              # 実際のBootROMファイルで実行
@@ -49,7 +49,10 @@ rustboy/
 └── src/
     ├── main.rs                 # エントリポイント・テストハーネス
     ├── memory_map.rs           # メモリアドレス定義（dmg, io_registers モジュール）
-    ├── peripherals.rs          # メモリバス・アドレスデコード
+    ├── peripherals.rs          # メモリバス・アドレスデコード（全周辺機器統合）
+    ├── joypad.rs               # ジョイパッド入力（方向キー/ボタンキー、割り込み）
+    ├── dma.rs                  # OAM DMA転送コントローラ（160バイト転送）
+    ├── cartridge.rs            # カートリッジ・MBCシステム（ROM ONLY/MBC1対応）
     ├── lcd.rs                  # SDL2 LCD表示（with_sdl機能フラグ）
     ├── simple_display.rs       # ASCIIフォールバック表示
     ├── memory/
@@ -65,11 +68,12 @@ rustboy/
     │   ├── interrupts.rs       # 割り込みコントローラ（VBlank/STAT/Timer/Serial/Joypad）
     │   └── timer.rs            # タイマーシステム（DIV/TIMA/TMA/TAC）
     └── ppu/
-        ├── mod.rs              # PPUコア（Mode 0-3遷移、フレームバッファ）
-        ├── registers.rs        # LCDレジスタ（LCDC, STAT, SCY, SCX, LY, LYC, BGP）
+        ├── mod.rs              # PPUコア（Mode 0-3遷移、BG/ウィンドウ/スプライト描画）
+        ├── registers.rs        # LCDレジスタ（LCDC, STAT, SCY, SCX, LY, LYC, BGP, OBP0/1, WY, WX）
         ├── vram.rs             # VRAM（8KB、タイルデータ/マップアクセス）
         ├── tiles.rs            # タイルレンダリング（キャッシュ、パレット変換）
         ├── background.rs       # 背景描画（スクロール、折り返し対応）
+        ├── sprites.rs          # スプライト描画（OAMスキャン、8x8/8x16、優先度、反転）
         └── timing.rs           # PPUタイミング定数
 ```
 
@@ -79,12 +83,15 @@ rustboy/
 
 ```
 main.rs
-  ├── Peripherals (メモリバス — PPU/Timer/割り込みを統合)
+  ├── Peripherals (メモリバス — 全周辺機器を統合)
   │     ├── BootRom
   │     ├── WorkRam
   │     ├── HighRam
-  │     ├── Ppu (VRAM/OAM/レジスタのメモリバスアクセス)
+  │     ├── Ppu (VRAM/OAM/レジスタ、BG/ウィンドウ/スプライト描画)
   │     ├── Timer (DIV/TIMA/TMA/TAC)
+  │     ├── Joypad (方向キー/ボタンキー入力)
+  │     ├── Dma (OAM DMA転送コントローラ)
+  │     ├── Cartridge (ROM/RAM/MBC1バンク切り替え)
   │     ├── interrupt_flag (IF: 0xFF0F)
   │     └── interrupt_enable (IE: 0xFFFF)
   ├── Cpu
@@ -95,8 +102,13 @@ main.rs
   └── Display (lcd.rs / simple_display.rs)
 ```
 
+### 入力・DMA・カートリッジ
+- **Joypad** (`src/joypad.rs`) — ジョイパッド入力。方向キー/ボタンキーの2グループ選択式。P14/P15ビットで選択、High→Low遷移で割り込み要求
+- **DMA** (`src/dma.rs`) — OAM DMA転送コントローラ。0xFF46書き込みで転送開始、160バイトを640Tサイクルで転送
+- **Cartridge** (`src/cartridge.rs`) — カートリッジROM/RAM管理。ROM ONLY/MBC1/MBC1+RAM/MBC1+RAM+BATTERY対応。ROMバンク切り替え（5bit）、RAMバンク切り替え（2bit）、バンキングモード（ROM/RAM）
+
 ### メモリシステム
-- **Peripherals** (`src/peripherals.rs`) — メインメモリバス。PPU/Timer/IF/IEを統合し、`tick(cycles)`でCPUサイクルに同期して全周辺機器を駆動
+- **Peripherals** (`src/peripherals.rs`) — メインメモリバス。PPU/Timer/Joypad/DMA/Cartridgeを統合し、`tick(cycles)`でCPUサイクルに同期して全周辺機器を駆動
 - **BootROM** (`src/memory/bootrom.rs`) — 256バイト、0xFF50書き込みで無効化（不可逆）
 - **WorkRAM** (`src/memory/wram.rs`) — 8KB（0xC000-0xDFFF）、0xE000-0xFDFFのエコー領域をミラー
 - **HighRAM** (`src/memory/hram.rs`) — 127バイト（0xFF80-0xFFFE）、スタック操作ヘルパー付き
@@ -111,11 +123,12 @@ main.rs
 - **Timer** (`src/cpu/timer.rs`) — 16bit内部カウンタ、DIV/TIMA/TMA/TAC、falling edge検出によるTIMAインクリメント
 
 ### PPUシステム
-- **PPU Core** (`src/ppu/mod.rs`) — Mode 0(HBlank), 1(VBlank), 2(OamScan), 3(Drawing)のタイミング遷移。160×144 RGB888フレームバッファ出力
+- **PPU Core** (`src/ppu/mod.rs`) — Mode 0(HBlank), 1(VBlank), 2(OamScan), 3(Drawing)のタイミング遷移。BG/ウィンドウ/スプライトを統合描画。160×144 RGB888フレームバッファ出力
 - **VRAM** (`src/ppu/vram.rs`) — 8KB、タイルデータ(2bpp)読み出し、Signed/Unsigned両アドレッシングモード対応
-- **Registers** (`src/ppu/registers.rs`) — LCDC(0xFF40), STAT(0xFF41), SCY/SCX, LY, LYC, BGP のビットレベルアクセサ
+- **Registers** (`src/ppu/registers.rs`) — LCDC, STAT, SCY/SCX, LY, LYC, BGP, OBP0/OBP1, WY/WX のビットレベルアクセサ
 - **Tiles** (`src/ppu/tiles.rs`) — 8×8タイルレンダリング、LRUキャッシュ（最大64タイル）、4色→RGB888パレット変換
 - **Background** (`src/ppu/background.rs`) — 32×32タイルマップ（256×256px）上のスキャンライン描画、スクロール折り返し
+- **Sprites** (`src/ppu/sprites.rs`) — OAMスキャン（1スキャンラインあたり最大10スプライト）、8×8/8×16モード、X/Y反転、BG優先度、OBP0/OBP1パレット
 - **Timing** (`src/ppu/timing.rs`) — CPU周波数4,194,304Hz、フレーム70224サイクル、目標59.73FPS
 
 ### 表示システム
@@ -127,9 +140,9 @@ main.rs
 | アドレス範囲 | サイズ | 用途 | 実装状況 |
 |---|---|---|---|
 | 0x0000-0x00FF | 256B | BootROM（0xFF50で無効化） | ✅ |
-| 0x0100-0x7FFF | 32KB | カートリッジROM | ❌ 未実装 |
+| 0x0100-0x7FFF | 32KB | カートリッジROM | ✅ ROM ONLY/MBC1対応 |
 | 0x8000-0x9FFF | 8KB | VRAM（タイルデータ+タイルマップ） | ✅ |
-| 0xA000-0xBFFF | 8KB | カートリッジRAM | ❌ 未実装 |
+| 0xA000-0xBFFF | 8KB | カートリッジRAM | ✅ MBC1 RAM対応 |
 | 0xC000-0xDFFF | 8KB | Work RAM | ✅ |
 | 0xE000-0xFDFF | — | WRAMエコー（ミラー） | ✅ |
 | 0xFE00-0xFE9F | 160B | OAM（スプライト属性） | ✅ メモリバス統合済み |
@@ -155,7 +168,7 @@ main.rs
 
 ## 主要な設計パターン
 
-- **統合メモリバス**: 全メモリアクセスは`Peripherals`構造体を経由。PPU/Timer/IF/IEを内包し、`tick()`で同期駆動
+- **統合メモリバス**: 全メモリアクセスは`Peripherals`構造体を経由。PPU/Timer/Joypad/DMA/Cartridgeを内包し、`tick()`で同期駆動
 - **CPU命令実行**: `execute_instruction`のmatchでオペコード直接ディスパッチ。ALUヘルパーメソッドで算術・論理演算を共通化
 - **割り込みシステム**: `handle_interrupts()`でIF&IEチェック→PCスタック退避→ハンドラジャンプ。EI命令は1命令遅延
 - **PPUモードタイミング**: ハードウェア精確なMode遷移（OamScan→Drawing→HBlank→VBlank）。フレームあたり70224サイクル
@@ -166,14 +179,18 @@ main.rs
 
 ## テスト戦略
 
-全93テスト。各モジュールにユニットテストを内蔵：
+全127テスト。各モジュールにユニットテストを内蔵：
 - **メモリ**: BootROM読み書き・無効化、WRAM読み書き・アドレス変換、HRAM読み書き・境界値
-- **メモリバス**: Peripherals統合テスト（BootROM/WRAM/HRAM/VRAM/OAM/PPUレジスタ/割り込みレジスタ/VBlank tick）
+- **メモリバス**: Peripherals統合テスト（BootROM/WRAM/HRAM/VRAM/OAM/PPUレジスタ/割り込みレジスタ/VBlank tick/Joypad/DMA/OBP/カートリッジ）
 - **メモリマップ**: 領域判定、アドレス情報取得、I/Oレジスタ名解決
 - **CPU**: レジスタ、フラグ、命令デコード、LD/ALU/PUSH/POP/CALL/RET/JR/CB/LDH/ローテート/割り込み/HALT復帰
 - **割り込み**: マスク、ハンドラアドレス、優先順位、IE&IFフィルタ
 - **タイマー**: DIVインクリメント/リセット、TIMA周波数選択、オーバーフロー割り込み
 - **PPU**: 生成・初期化、Modeタイミング遷移、VRAMアクセス、タイルデータ読み出し、タイルキャッシュ、色変換、背景描画、スクロール折り返し
+- **スプライト**: OAMエントリ解析、フラグ判定、スキャンライン判定（8×8/8×16）、OAMスキャン上限・ソート、透明色、基本描画
+- **ジョイパッド**: 初期化、方向キー/ボタンキー選択、ボタン押下/離し、グループ分離、割り込み発生、未選択状態
+- **DMA**: 初期化、転送開始、転送アドレス、転送完了、非アクティブ状態
+- **カートリッジ**: ROM ONLY読み取り、ヘッダ解析、MBC1バンク切り替え、バンク0リダイレクト、MBC1 RAM有効/無効、サイズ検証
 - **表示**: SimpleDisplay生成、色変換、FPSカウンタ
 
 ## 現在の実装状況
@@ -184,7 +201,8 @@ main.rs
 | Phase 3 | CPU基礎（11命令） | ✅ 完了 |
 | Phase 4 | PPU・LCD表示 | ✅ 完了 |
 | Phase 5 | メモリバス統合・割り込み・タイマー・CPU命令拡張（500命令） | ✅ 完了 |
-| Phase 6+ | スプライト、ウィンドウ、DMA、APU、入力、カートリッジ | 🔲 未着手 |
+| Phase 6 | スプライト・ウィンドウ・DMA・ジョイパッド・カートリッジ/MBC1 | ✅ 完了 |
+| Phase 7+ | APU（音声）、MBC2/3/5、シリアル通信 | 🔲 未着手 |
 
 ## 開発ガイドライン
 
