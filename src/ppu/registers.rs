@@ -2,12 +2,16 @@
 
 pub struct PpuRegisters {
     pub lcdc: u8,    // 0xFF40 - LCD制御
-    pub stat: u8,    // 0xFF41 - LCDステータス  
+    pub stat: u8,    // 0xFF41 - LCDステータス
     pub scy: u8,     // 0xFF42 - スクロールY
     pub scx: u8,     // 0xFF43 - スクロールX
     pub ly: u8,      // 0xFF44 - LCD Y座標
     pub lyc: u8,     // 0xFF45 - LY比較
     pub bgp: u8,     // 0xFF47 - BGパレット
+    pub obp0: u8,    // 0xFF48 - オブジェクトパレット0
+    pub obp1: u8,    // 0xFF49 - オブジェクトパレット1
+    pub wy: u8,      // 0xFF4A - ウィンドウY
+    pub wx: u8,      // 0xFF4B - ウィンドウX
 }
 
 impl PpuRegisters {
@@ -20,6 +24,10 @@ impl PpuRegisters {
             ly: 0x00,
             lyc: 0x00,
             bgp: 0xFC,   // デフォルトパレット (11111100)
+            obp0: 0xFF,  // デフォルトスプライトパレット0
+            obp1: 0xFF,  // デフォルトスプライトパレット1
+            wy: 0x00,    // ウィンドウY位置
+            wx: 0x00,    // ウィンドウX位置
         }
     }
     
@@ -91,6 +99,28 @@ impl PpuRegisters {
             _ => unreachable!(),
         }
     }
+
+    // OBP0 パレット変換 (スプライトパレット0)
+    pub fn get_obp0_color(&self, color_id: u8) -> u8 {
+        match color_id & 0x03 {
+            0 => self.obp0 & 0x03,         // 透明（使用されない）
+            1 => (self.obp0 >> 2) & 0x03,
+            2 => (self.obp0 >> 4) & 0x03,
+            3 => (self.obp0 >> 6) & 0x03,
+            _ => unreachable!(),
+        }
+    }
+
+    // OBP1 パレット変換 (スプライトパレット1)
+    pub fn get_obp1_color(&self, color_id: u8) -> u8 {
+        match color_id & 0x03 {
+            0 => self.obp1 & 0x03,         // 透明（使用されない）
+            1 => (self.obp1 >> 2) & 0x03,
+            2 => (self.obp1 >> 4) & 0x03,
+            3 => (self.obp1 >> 6) & 0x03,
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,10 +145,39 @@ mod tests {
     fn test_bg_palette() {
         let mut registers = PpuRegisters::new();
         registers.bgp = 0b11100100;  // 3,2,1,0 の順
-        
+
         assert_eq!(registers.get_bg_palette_color(0), 0);  // 00
         assert_eq!(registers.get_bg_palette_color(1), 1);  // 01
         assert_eq!(registers.get_bg_palette_color(2), 2);  // 10
         assert_eq!(registers.get_bg_palette_color(3), 3);  // 11
+    }
+
+    #[test]
+    fn test_sprite_palette() {
+        let mut registers = PpuRegisters::new();
+        registers.obp0 = 0b11100100;
+        registers.obp1 = 0b00011011; // 反転パレット
+
+        // OBP0
+        assert_eq!(registers.get_obp0_color(0), 0);
+        assert_eq!(registers.get_obp0_color(1), 1);
+        assert_eq!(registers.get_obp0_color(2), 2);
+        assert_eq!(registers.get_obp0_color(3), 3);
+
+        // OBP1
+        assert_eq!(registers.get_obp1_color(0), 3);
+        assert_eq!(registers.get_obp1_color(1), 2);
+        assert_eq!(registers.get_obp1_color(2), 1);
+        assert_eq!(registers.get_obp1_color(3), 0);
+    }
+
+    #[test]
+    fn test_window_registers() {
+        let mut registers = PpuRegisters::new();
+        registers.wy = 0x10;
+        registers.wx = 0x07; // WX=7 はウィンドウ左端
+
+        assert_eq!(registers.wy, 0x10);
+        assert_eq!(registers.wx, 0x07);
     }
 }

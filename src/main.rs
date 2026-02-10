@@ -8,6 +8,9 @@ mod peripherals;     // メモリバス
 mod cpu;             // CPUコンポーネント
 mod ppu;             // PPUコンポーネント
 mod simple_display;  // 簡易ASCII表示
+mod joypad;          // ジョイパッド入力
+mod dma;             // DMA転送コントローラ
+mod cartridge;       // カートリッジ・MBCシステム
 
 #[cfg(feature = "with_sdl")]
 mod lcd;             // LCDディスプレイ

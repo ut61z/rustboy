@@ -8,6 +8,9 @@ use crate::memory::{
 };
 use crate::ppu::Ppu;
 use crate::cpu::timer::Timer;
+use crate::joypad::Joypad;
+use crate::dma::Dma;
+use crate::cartridge::Cartridge;
 
 pub struct Peripherals {
     bootrom: BootRom,
@@ -15,6 +18,9 @@ pub struct Peripherals {
     hram: HighRam,
     pub ppu: Ppu,
     pub timer: Timer,
+    pub joypad: Joypad,
+    pub dma: Dma,
+    pub cartridge: Option<Cartridge>,
 
     // 割り込みレジスタ
     pub interrupt_flag: u8,     // IF (0xFF0F)
@@ -34,6 +40,9 @@ impl Peripherals {
             hram: HighRam::new(),
             ppu: Ppu::new(),
             timer: Timer::new(),
+            joypad: Joypad::new(),
+            dma: Dma::new(),
+            cartridge: None,
             interrupt_flag: 0x00,
             interrupt_enable: 0x00,
             read_count: 0,
@@ -46,11 +55,25 @@ impl Peripherals {
         Self::new(BootRom::new_dummy())
     }
 
-    /// CPUサイクルに同期してPPU/Timerを進める
+    /// カートリッジをセット
+    pub fn load_cartridge(&mut self, cartridge: Cartridge) {
+        self.cartridge = Some(cartridge);
+    }
+
+    /// CPUサイクルに同期してPPU/Timer/DMAを進める
     pub fn tick(&mut self, cycles: u8) {
         for _ in 0..cycles {
             self.ppu.step();
             self.timer.tick();
+
+            // DMA転送処理
+            if let Some((src, dst)) = self.dma.tick() {
+                let value = self.dma_read(src);
+                let oam_offset = (dst - OAM_START) as usize;
+                if oam_offset < 160 {
+                    self.ppu.oam[oam_offset] = value;
+                }
+            }
         }
 
         // PPUの割り込みフラグをIFに反映
@@ -68,6 +91,48 @@ impl Peripherals {
             self.interrupt_flag |= 0x04; // Timer割り込み (bit 2)
             self.timer.interrupt_request = false;
         }
+
+        // Joypadの割り込みフラグをIFに反映
+        if self.joypad.interrupt_request {
+            self.interrupt_flag |= 0x10; // Joypad割り込み (bit 4)
+            self.joypad.interrupt_request = false;
+        }
+    }
+
+    /// DMA転送用の読み取り（OAMを除く全メモリからの読み取り）
+    fn dma_read(&self, addr: u16) -> u8 {
+        match addr {
+            BOOTROM_START..=BOOTROM_END => {
+                if self.bootrom.is_active() {
+                    self.bootrom.read(addr)
+                } else if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(addr)
+                } else {
+                    0xFF
+                }
+            }
+            0x0100..=0x7FFF => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(addr)
+                } else {
+                    0xFF
+                }
+            }
+            VRAM_START..=VRAM_END => self.ppu.read_vram(addr),
+            CARTRIDGE_RAM_START..=CARTRIDGE_RAM_END => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_ram(addr)
+                } else {
+                    0xFF
+                }
+            }
+            WRAM_START..=WRAM_END => self.wram.read(addr),
+            WRAM_ECHO_START..=WRAM_ECHO_END => {
+                let wram_addr = WRAM_START + (addr - WRAM_ECHO_START);
+                self.wram.read(wram_addr)
+            }
+            _ => 0xFF,
+        }
     }
     
     /// 指定されたアドレスからデータを読み取る
@@ -79,22 +144,35 @@ impl Peripherals {
             BOOTROM_START..=BOOTROM_END => {
                 if self.bootrom.is_active() {
                     self.bootrom.read(addr)
+                } else if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(addr)
                 } else {
-                    // BootROM無効時は通常はCartridge ROMを読むが、今は未実装なので0xFF
                     0xFF
                 }
             }
 
             // カートリッジROM領域（BootROM以降）
-            0x0100..=0x7FFF => 0xFF, // 未実装
+            0x0100..=0x7FFF => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_rom(addr)
+                } else {
+                    0xFF
+                }
+            }
 
             // VRAM領域
             VRAM_START..=VRAM_END => {
                 self.ppu.read_vram(addr)
             }
 
-            // カートリッジRAM（未実装）
-            CARTRIDGE_RAM_START..=CARTRIDGE_RAM_END => 0xFF,
+            // カートリッジRAM
+            CARTRIDGE_RAM_START..=CARTRIDGE_RAM_END => {
+                if let Some(ref cart) = self.cartridge {
+                    cart.read_ram(addr)
+                } else {
+                    0xFF
+                }
+            }
 
             // Work RAM領域
             WRAM_START..=WRAM_END => {
@@ -140,6 +218,9 @@ impl Peripherals {
     /// I/Oレジスタの読み取り
     fn read_io(&self, addr: u16) -> u8 {
         match addr {
+            // ジョイパッド
+            JOYP => self.joypad.read(),
+
             // PPUレジスタ
             LCDC => self.ppu.registers.lcdc,
             STAT => {
@@ -152,11 +233,12 @@ impl Peripherals {
             SCX => self.ppu.registers.scx,
             LY => self.ppu.scanline,
             LYC => self.ppu.registers.lyc,
+            DMA => self.dma.read(),
             BGP => self.ppu.registers.bgp,
-            OBP0 | OBP1 | WY | WX | DMA => {
-                // OBP0/OBP1/WY/WX/DMAは将来のPhaseで実装
-                0xFF
-            }
+            OBP0 => self.ppu.registers.obp0,
+            OBP1 => self.ppu.registers.obp1,
+            WY => self.ppu.registers.wy,
+            WX => self.ppu.registers.wx,
 
             // タイマーレジスタ
             DIV => self.timer.read_div(),
@@ -187,22 +269,31 @@ impl Peripherals {
         println!("WRITE 0x{:04X} = 0x{:02X} [{}]", addr, value, get_region_name(addr));
 
         match addr {
-            // BootROM領域（読み取り専用）
+            // BootROM/カートリッジROM Bank 0 領域（MBCレジスタ操作）
             BOOTROM_START..=BOOTROM_END => {
-                #[cfg(debug_assertions)]
-                println!("警告: BootROM領域への書き込み試行: 0x{:04X} = 0x{:02X}", addr, value);
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_rom(addr, value);
+                }
             }
 
-            // カートリッジROM領域（読み取り専用、MBC未実装）
-            0x0100..=0x7FFF => {}
+            // カートリッジROM領域（MBCレジスタ操作）
+            0x0100..=0x7FFF => {
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_rom(addr, value);
+                }
+            }
 
             // VRAM領域
             VRAM_START..=VRAM_END => {
                 self.ppu.write_vram(addr, value);
             }
 
-            // カートリッジRAM（未実装）
-            CARTRIDGE_RAM_START..=CARTRIDGE_RAM_END => {}
+            // カートリッジRAM
+            CARTRIDGE_RAM_START..=CARTRIDGE_RAM_END => {
+                if let Some(ref mut cart) = self.cartridge {
+                    cart.write_ram(addr, value);
+                }
+            }
 
             // Work RAM領域
             WRAM_START..=WRAM_END => {
@@ -243,6 +334,9 @@ impl Peripherals {
     /// I/Oレジスタへの書き込み
     fn write_io(&mut self, addr: u16, value: u8) {
         match addr {
+            // ジョイパッド
+            JOYP => self.joypad.write(value),
+
             // PPUレジスタ
             LCDC => self.ppu.registers.lcdc = value,
             STAT => {
@@ -251,12 +345,14 @@ impl Peripherals {
             }
             SCY => self.ppu.registers.scy = value,
             SCX => self.ppu.registers.scx = value,
-            LY => {} // LYは読み取り専用（書き込みでリセットする実装もあるが無視）
+            LY => {} // LYは読み取り専用
             LYC => self.ppu.registers.lyc = value,
+            DMA => self.dma.start(value),
             BGP => self.ppu.registers.bgp = value,
-            OBP0 | OBP1 | WY | WX | DMA => {
-                // 将来のPhaseで実装
-            }
+            OBP0 => self.ppu.registers.obp0 = value,
+            OBP1 => self.ppu.registers.obp1 = value,
+            WY => self.ppu.registers.wy = value,
+            WX => self.ppu.registers.wx = value,
 
             // タイマーレジスタ
             DIV => self.timer.write_div(),
@@ -538,5 +634,98 @@ mod tests {
 
         // VBlank割り込みがIFに反映されているはず
         assert_ne!(peripherals.interrupt_flag & 0x01, 0);
+    }
+
+    #[test]
+    fn test_peripherals_joypad() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // JOYP書き込み：方向キー選択
+        peripherals.write(0xFF00, 0x20);
+
+        // ジョイパッドにボタン押下
+        peripherals.joypad.press(crate::joypad::JoypadButton::Right);
+
+        // 読み取り: Rightが押されている
+        let joyp = peripherals.read(0xFF00);
+        assert_eq!(joyp & 0x01, 0x00); // bit0=0 (Right押下)
+    }
+
+    #[test]
+    fn test_peripherals_dma() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // WRAMにテストデータを配置
+        for i in 0..160u8 {
+            peripherals.write(0xC000 + i as u16, i);
+        }
+
+        // DMA開始
+        peripherals.write(0xFF46, 0xC0); // 転送元: 0xC000
+
+        // DMA完了まで実行
+        for _ in 0..700 {
+            peripherals.tick(1);
+        }
+
+        // PPUをHBlankモードに変更してOAM読み取りを許可
+        peripherals.ppu.mode = crate::ppu::PpuMode::HBlank;
+
+        // OAMにデータがコピーされているか確認
+        assert_eq!(peripherals.read(0xFE00), 0);
+        assert_eq!(peripherals.read(0xFE01), 1);
+        assert_eq!(peripherals.read(0xFE9F), 159);
+    }
+
+    #[test]
+    fn test_peripherals_obp_registers() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // OBP0/OBP1書き込み・読み取り
+        peripherals.write(0xFF48, 0xE4);
+        peripherals.write(0xFF49, 0x1B);
+        assert_eq!(peripherals.read(0xFF48), 0xE4);
+        assert_eq!(peripherals.read(0xFF49), 0x1B);
+
+        // WY/WX書き込み・読み取り
+        peripherals.write(0xFF4A, 0x10);
+        peripherals.write(0xFF4B, 0x07);
+        assert_eq!(peripherals.read(0xFF4A), 0x10);
+        assert_eq!(peripherals.read(0xFF4B), 0x07);
+    }
+
+    #[test]
+    fn test_peripherals_cartridge_rom() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+
+        // BootROMを無効化
+        peripherals.write(0xFF50, 0x01);
+
+        // カートリッジ未装着時は0xFF
+        assert_eq!(peripherals.read(0x0100), 0xFF);
+
+        // テスト用ROMを作成してセット
+        let mut rom_data = vec![0u8; 0x8000];
+        rom_data[0x0100] = 0x42;
+        rom_data[0x4000] = 0x99;
+        let cart = crate::cartridge::Cartridge::new_rom_only(rom_data);
+        peripherals.load_cartridge(cart);
+
+        // カートリッジROMが読める
+        assert_eq!(peripherals.read(0x0100), 0x42);
+        assert_eq!(peripherals.read(0x4000), 0x99);
+    }
+
+    #[test]
+    fn test_peripherals_joypad_interrupt() {
+        let mut peripherals = Peripherals::new_with_dummy_bootrom();
+        peripherals.joypad.write(0x20); // 方向キー選択
+
+        // ボタン押下で割り込み発生
+        peripherals.joypad.press(crate::joypad::JoypadButton::Right);
+        peripherals.tick(1);
+
+        // Joypad割り込みがIFに反映
+        assert_ne!(peripherals.interrupt_flag & 0x10, 0);
     }
 }
