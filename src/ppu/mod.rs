@@ -216,7 +216,31 @@ impl Ppu {
         self.stat_interrupt = false;
     }
     
-    // メモリ読み込み
+    /// VRAM読み込み（Peripheralsから呼ばれる）
+    pub fn read_vram(&self, address: u16) -> u8 {
+        self.vram.read(address - dmg::VRAM_START)
+    }
+
+    /// VRAM書き込み（Peripheralsから呼ばれる、Drawingモード中はブロック）
+    pub fn write_vram(&mut self, address: u16, value: u8) {
+        if self.mode != PpuMode::Drawing {
+            self.vram.write(address - dmg::VRAM_START, value);
+        }
+    }
+
+    /// OAM読み込み（Peripheralsから呼ばれる）
+    pub fn read_oam(&self, address: u16) -> u8 {
+        self.oam[(address - dmg::OAM_START) as usize]
+    }
+
+    /// OAM書き込み（Peripheralsから呼ばれる、Drawing/OamScanモード中はブロック）
+    pub fn write_oam(&mut self, address: u16, value: u8) {
+        if self.mode != PpuMode::Drawing && self.mode != PpuMode::OamScan {
+            self.oam[(address - dmg::OAM_START) as usize] = value;
+        }
+    }
+
+    // メモリ読み込み（レガシー: PPU単体テスト用）
     pub fn read(&self, address: u16) -> u8 {
         match address {
             dmg::VRAM_START..=dmg::VRAM_END => {
